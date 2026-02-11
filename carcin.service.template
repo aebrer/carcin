@@ -1,0 +1,17 @@
+[Unit]
+Description=Carcin — Claude Code Telegram Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/carcin
+Environment=TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+Environment=ALLOWED_USER_IDS=YOUR_TELEGRAM_USER_ID
+Environment=CLAUDE_WORKING_DIR=%h
+ExecStart=%h/carcin/.venv/bin/python -u bot.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
