@@ -6,6 +6,8 @@ Named after [carcinization](https://en.wikipedia.org/wiki/Carcinisation) — the
 
 Carcin bridges Telegram and Claude Code, giving you full access to your AI coding assistant from anywhere. Send a message on Telegram, get Claude Code's full power — tool use, file editing, web search, subagents, everything — streamed back to your phone in real time.
 
+**Note:** Carcin is designed for single-user operation — one person, one bot, one machine. The architecture assumes a single active conversation at a time. If you need multi-user access, you'd want separate bot instances.
+
 ## Why Carcin?
 
 There are other Claude-Telegram bridges. Carcin solves the problems they don't:
@@ -29,6 +31,7 @@ There are other Claude-Telegram bridges. Carcin solves the problems they don't:
 | Session persistence | `/sessions` to list, `/resume` to continue any past conversation |
 | Message replay | `/recent [N]` re-sends last N messages, split for Telegram limits |
 | Interrupt | `/stop` sends SIGINT — Claude stops after the current operation |
+| Compaction notification | PreCompact hook alerts you when Claude is compacting context |
 | Auth | Only configured Telegram user IDs can interact with the bot |
 
 ## Setup
@@ -131,6 +134,46 @@ The `telegram-send` skill lets Claude send files back to you through Telegram. W
 ### Adding your own skills
 
 Drop skill files into the `skills/` directory following the [Claude Code skill format](https://docs.anthropic.com/en/docs/claude-code). Skills that reference Telegram-specific behavior (like `telegram-send`) go here. General-purpose skills should go in your `~/.claude/skills/` directory instead.
+
+## Context Compaction Notification
+
+When Claude's context window fills up, it auto-compacts — summarizing the conversation to free space. This causes a long pause with no output, which is confusing on Telegram where you can't see what's happening.
+
+Carcin includes a [PreCompact hook](https://docs.anthropic.com/en/docs/claude-code) that sends a Telegram notification when compaction starts, so you know why the stream went quiet.
+
+### Setup
+
+Copy the hook script somewhere permanent:
+
+```bash
+mkdir -p ~/.claude/hooks
+cp hooks/notify-compact.py ~/.claude/hooks/
+```
+
+Register it in `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ~/.claude/hooks/notify-compact.py"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook uses stdlib only (`urllib.request`) — no extra dependencies. It inherits `TELEGRAM_BOT_TOKEN` and `ALLOWED_USER_IDS` from the bot's subprocess chain automatically:
+
+```
+systemd service → bot.py → claude subprocess → PreCompact hook
+```
 
 ## Architecture
 

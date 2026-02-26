@@ -18,3 +18,8 @@ Single-file Python bot (`bot.py`) that bridges Telegram and Claude Code.
 - stderr is drained concurrently to prevent pipe buffer deadlocks (this is critical)
 - Each user's subprocess runs as a background asyncio task so /stop works without blocking
 - Sessions persist to disk for cross-restart continuity
+- Per-user message queue (asyncio.Queue) ensures sequential processing — no conversation forking
+- File batching: media groups via `media_group_id`, documents via 3s per-user debounce
+- PreCompact hook (`hooks/notify-compact.py`) sends Telegram notification when context compaction starts
+  - Inherits env vars through: `systemd → bot.py → claude subprocess → hook`
+  - Uses stdlib only (urllib.request) — no dependencies
