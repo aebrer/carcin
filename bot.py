@@ -45,6 +45,19 @@ NEW_SESSION_FLAG: set[int] = set()  # Users who want next message to start fresh
 RESUME_SESSION: dict[int, str] = {}  # Users who want to resume a specific session
 RUNNING_PROCS: dict[int, asyncio.subprocess.Process] = {}  # Active subprocess per user
 
+# Per-user message queue — prevents conversation forking by ensuring only one
+# Claude subprocess runs at a time. Messages arriving while Claude is busy
+# are queued and processed sequentially.
+USER_QUEUES: dict[int, asyncio.Queue] = {}
+QUEUE_PROCESSORS: dict[int, asyncio.Task] = {}
+
+# File batching — handles two cases:
+# 1. Media groups (photos/videos): Telegram assigns a shared media_group_id
+# 2. Rapid sequential files (documents): no media_group_id, so we debounce per-user
+# Both use the same buffer/timer pattern with different keys.
+MEDIA_GROUP_BUFFERS: dict[str, dict] = {}  # buffer_key -> {files, caption, ...}
+MEDIA_GROUP_TIMERS: dict[str, asyncio.Task] = {}  # buffer_key -> delayed task
+
 # Session persistence file
 SESSIONS_FILE = Path(os.environ.get("CLAUDE_SESSIONS_FILE", Path.home() / ".carcin-sessions.json"))
 
@@ -357,10 +370,6 @@ async def _process_claude(user_id: int, message, cmd: list[str], user_message: s
         if not text_messages:
             await message.reply_text("(No response)")
 
-        # Done marker so it's clear Claude is waiting for input
-        if not interrupted:
-            await message.reply_text(f"🦀 _{DONE_MARKER}_", parse_mode=ParseMode.MARKDOWN)
-
     except Exception as e:
         RUNNING_PROCS.pop(user_id, None)
         try:
@@ -369,11 +378,98 @@ async def _process_claude(user_id: int, message, cmd: list[str], user_message: s
             await message.reply_text(f"❌ Error: {str(e)[:200]}")
 
 
+def _is_claude_busy(user_id: int) -> bool:
+    """Check if a queue processor is actively running for this user."""
+    task = QUEUE_PROCESSORS.get(user_id)
+    return task is not None and not task.done()
+
+
+def _build_claude_cmd(user_id: int, prompt: str) -> list[str]:
+    """Build Claude CLI command, consuming session flags."""
+    start_fresh = user_id in NEW_SESSION_FLAG
+    if start_fresh:
+        NEW_SESSION_FLAG.discard(user_id)
+    resume_id = RESUME_SESSION.pop(user_id, None)
+
+    cmd = [CLAUDE_PATH, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    if resume_id:
+        cmd.extend(["--resume", resume_id])
+    elif not start_fresh:
+        cmd.append("--continue")
+    return cmd
+
+
+async def _queue_processor(user_id: int):
+    """Process queued Claude requests sequentially for a user.
+
+    Ensures only one Claude subprocess runs at a time, preventing conversation
+    forks. Sends the done marker only when the queue is fully drained normally
+    (not after /stop interruption).
+    """
+    queue = USER_QUEUES[user_id]
+    last_message = None
+    interrupted = False
+
+    try:
+        while not queue.empty():
+            item = await queue.get()
+            message, cmd, preview, status_msg, is_queued = item
+            last_message = message
+
+            if is_queued:
+                await safe_reply(message, f"📨 _Processing queued message:_ {preview[:200]}")
+
+            await _process_claude(user_id, message, cmd, preview, status_msg)
+
+            # Check if the subprocess was interrupted (e.g. /stop)
+            proc = RUNNING_PROCS.get(user_id)
+            if proc and proc.returncode and proc.returncode != 0:
+                interrupted = True
+
+            queue.task_done()
+    except Exception as e:
+        log(f"[QUEUE] Processor crashed for user {user_id}: {e}")
+        if last_message:
+            try:
+                await last_message.reply_text(f"❌ Queue error: {str(e)[:200]}")
+            except Exception:
+                pass
+    finally:
+        QUEUE_PROCESSORS.pop(user_id, None)
+
+    # Only send DONE if queue drained normally (not after /stop)
+    if last_message and not interrupted:
+        try:
+            await last_message.reply_text(f"🦀 _{DONE_MARKER}_", parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
+
+
+def _enqueue_claude(user_id: int, message, cmd: list[str], preview: str, status_msg):
+    """Add a Claude request to the per-user queue.
+
+    Starts the queue processor if not already running. Items queued while
+    Claude is busy will be marked as queued so the user gets a notification
+    when they start processing.
+    """
+    if user_id not in USER_QUEUES:
+        USER_QUEUES[user_id] = asyncio.Queue()
+
+    queue = USER_QUEUES[user_id]
+    is_queued = not queue.empty() or _is_claude_busy(user_id)
+    queue.put_nowait((message, cmd, preview, status_msg, is_queued))
+
+    # Start processor if not already running
+    existing = QUEUE_PROCESSORS.get(user_id)
+    if not existing or existing.done():
+        QUEUE_PROCESSORS[user_id] = asyncio.create_task(_queue_processor(user_id))
+
+
 async def handle_message(update: Update, context) -> None:
     """Handle incoming Telegram messages.
 
-    Does quick validation then spawns _process_claude as a background task,
-    returning immediately so the event loop stays free for /stop and other commands.
+    Does quick validation then enqueues the request. The per-user queue ensures
+    only one Claude subprocess runs at a time, preventing conversation forks.
     """
     log(f"[MSG] Received message from {update.effective_user.id}: {update.message.text[:50] if update.message.text else '(empty)'}")
     user_id = update.effective_user.id
@@ -388,105 +484,177 @@ async def handle_message(update: Update, context) -> None:
     if not user_message:
         return
 
-    # Check if user wants a new session
-    start_fresh = user_id in NEW_SESSION_FLAG
-    if start_fresh:
-        NEW_SESSION_FLAG.discard(user_id)
-        log(f"[MSG] Starting fresh session for user {user_id}")
+    cmd = _build_claude_cmd(user_id, user_message)
 
-    # Check if user wants to resume a specific session
-    resume_id = RESUME_SESSION.pop(user_id, None)
+    # Show appropriate status — "Queued" if Claude is already busy, "Thinking" if not
+    if _is_claude_busy(user_id):
+        status_msg = await update.message.reply_text("📋 _Queued..._", parse_mode=ParseMode.MARKDOWN)
+    else:
+        status_msg = await update.message.reply_text("🧠 _Thinking..._", parse_mode=ParseMode.MARKDOWN)
 
-    # Build command
-    cmd = [
-        CLAUDE_PATH, "-p", user_message,
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
-    if resume_id:
-        cmd.extend(["--resume", resume_id])
-    elif not start_fresh:
-        cmd.append("--continue")  # Continue most recent conversation in working dir
+    # Enqueue — processes immediately if nothing running, waits otherwise
+    _enqueue_claude(user_id, update.message, cmd, user_message[:80], status_msg)
 
-    # Send "thinking" indicator
-    status_msg = await update.message.reply_text("🧠 _Thinking..._", parse_mode=ParseMode.MARKDOWN)
 
-    # Spawn subprocess work as background task so event loop stays free for /stop
-    asyncio.create_task(_process_claude(user_id, update.message, cmd, user_message, status_msg))
+def _get_file_meta(msg) -> tuple | None:
+    """Extract file object and display name from a message (no I/O)."""
+    if msg.document:
+        return msg.document, msg.document.file_name or "document"
+    elif msg.photo:
+        return msg.photo[-1], "photo.jpg"
+    elif msg.voice:
+        return msg.voice, "voice.ogg"
+    elif msg.audio:
+        return msg.audio, msg.audio.file_name or "audio"
+    elif msg.video:
+        return msg.video, msg.video.file_name or "video.mp4"
+    return None
+
+
+async def _download_file(file_obj, message_id: int, file_name: str) -> Path:
+    """Download a Telegram file to disk. Returns the local path."""
+    tg_file = await file_obj.get_file()
+    local_path = UPLOAD_DIR / f"{message_id}_{file_name}"
+    await tg_file.download_to_drive(local_path)
+    log(f"[FILE] Downloaded to {local_path}")
+    return local_path
+
+
+async def _flush_file_batch(buffer_key: str):
+    """Wait for all files in a batch to arrive, then process as one Claude request.
+
+    The debounce window (3s) covers both Telegram's delivery gap between group
+    members AND the download time for large files like EPUBs. After the window,
+    we await all pending downloads before building the prompt.
+
+    INVARIANT: No `await` may be added between the asyncio.sleep return and the
+    identity check below — the debounce race guard relies on these running in the
+    same event loop tick.
+    """
+    await asyncio.sleep(3.0)
+
+    # If a newer timer replaced us (debounce race), bail out
+    if MEDIA_GROUP_TIMERS.get(buffer_key) is not asyncio.current_task():
+        return
+
+    buf = MEDIA_GROUP_BUFFERS.pop(buffer_key, None)
+    MEDIA_GROUP_TIMERS.pop(buffer_key, None)
+    if not buf:
+        return
+
+    user_id = buf["user_id"]
+    message = buf["message"]
+    status_msg = buf["status_msg"]
+    pending = buf["pending"]  # List of (asyncio.Task<Path>, file_name)
+    caption = buf["caption"]
+
+    try:
+        # Wait for all downloads to finish
+        files = []
+        failed = []
+        for download_task, file_name in pending:
+            try:
+                local_path = await download_task
+                files.append((local_path, file_name))
+            except Exception as e:
+                log(f"[FILE-BATCH] Download failed for {file_name}: {e}")
+                failed.append(file_name)
+
+        if not files:
+            await status_msg.edit_text("❌ All downloads failed.")
+            return
+
+        n = len(files)
+        log(f"[FILE-BATCH] Flushing {buffer_key}: {n} file(s)")
+
+        # Notify user of partial failures
+        if failed:
+            await safe_reply(message, f"⚠️ Failed to download: {', '.join(failed)}")
+
+        # Build prompt with all file paths
+        files_text = "\n".join(f"File path: {path}" for path, _ in files)
+        file_names = ", ".join(name for _, name in files)
+        user_message = f"{caption}\n\n{files_text}"
+
+        indicator = "📋 _Queued..._" if _is_claude_busy(user_id) else "🧠 _Processing..._"
+        if n == 1:
+            status = f"📥 Downloaded: `{file_names}`\n{indicator}"
+        else:
+            status = f"📥 Downloaded {n} files: {file_names}\n{indicator}"
+        await status_msg.edit_text(status, parse_mode=ParseMode.MARKDOWN)
+
+        cmd = _build_claude_cmd(user_id, user_message)
+        preview = f"[{n} file(s): {file_names}] {caption[:60]}"
+        _enqueue_claude(user_id, message, cmd, preview, status_msg)
+
+    except Exception as e:
+        log(f"[FILE-BATCH] Flush failed for {buffer_key}: {e}")
+        try:
+            await status_msg.edit_text(f"❌ File processing error: {str(e)[:200]}")
+        except Exception:
+            pass
 
 
 async def handle_file(update: Update, context) -> None:
-    """Handle incoming files (documents, photos, etc.)."""
+    """Handle incoming files (documents, photos, etc.).
+
+    All files go through a 3s debounce buffer to catch rapid sequential sends.
+    Media groups (photos/videos) are keyed by media_group_id; documents and
+    other files are keyed by user_id. After the debounce, all buffered files
+    are combined into a single Claude request.
+    """
     user_id = update.effective_user.id
     log(f"[FILE] Received file from {user_id}")
 
-    # Security: only allow configured users
     if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
         log(f"[FILE] User {user_id} not in allowed list")
         await update.message.reply_text("⛔ Not authorized")
         return
 
-    # Get the file object
-    if update.message.document:
-        file_obj = update.message.document
-        file_name = file_obj.file_name or "document"
-    elif update.message.photo:
-        # Photos come as a list of sizes, get the largest
-        file_obj = update.message.photo[-1]
-        file_name = "photo.jpg"
-    elif update.message.voice:
-        file_obj = update.message.voice
-        file_name = "voice.ogg"
-    elif update.message.audio:
-        file_obj = update.message.audio
-        file_name = file_obj.file_name or "audio"
-    elif update.message.video:
-        file_obj = update.message.video
-        file_name = file_obj.file_name or "video.mp4"
-    else:
+    # Extract file metadata immediately (no I/O)
+    meta = _get_file_meta(update.message)
+    if not meta:
         await update.message.reply_text("❓ Unsupported file type")
         return
+    file_obj, file_name = meta
 
-    # Download the file
-    status_msg = await update.message.reply_text("📥 Downloading file...")
-    try:
-        tg_file = await file_obj.get_file()
-        local_path = UPLOAD_DIR / f"{user_id}_{file_name}"
-        await tg_file.download_to_drive(local_path)
-        log(f"[FILE] Downloaded to {local_path}")
+    caption = update.message.caption or "I've uploaded a file. Please analyze it."
 
-        await status_msg.edit_text(f"📥 Downloaded: `{file_name}`\n🧠 _Processing..._", parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        log(f"[FILE] Download failed: {e}")
-        await status_msg.edit_text(f"❌ Failed to download: {e}")
-        return
+    # Buffer key: use media_group_id for albums, fall back to per-user key for
+    # documents sent in quick succession (Telegram doesn't group those).
+    media_group_id = update.message.media_group_id
+    buffer_key = media_group_id or f"user_{user_id}"
 
-    # Get caption or use default prompt
-    caption = update.message.caption or f"I've uploaded a file. Please analyze it."
-    user_message = f"{caption}\n\nFile path: {local_path}"
+    # Kick off download concurrently — don't await it here so the buffer
+    # registration happens instantly regardless of file size.
+    download_task = asyncio.create_task(
+        _download_file(file_obj, update.message.message_id, file_name)
+    )
 
-    # Check if user wants a new session
-    start_fresh = user_id in NEW_SESSION_FLAG
-    if start_fresh:
-        NEW_SESSION_FLAG.discard(user_id)
+    if buffer_key not in MEDIA_GROUP_BUFFERS:
+        # First file in this batch — create buffer and status message
+        status_msg = await update.message.reply_text("📥 Downloading files...")
+        MEDIA_GROUP_BUFFERS[buffer_key] = {
+            "user_id": user_id,
+            "message": update.message,
+            "status_msg": status_msg,
+            "pending": [(download_task, file_name)],
+            "caption": caption,
+        }
+    else:
+        # Additional file in existing batch
+        MEDIA_GROUP_BUFFERS[buffer_key]["pending"].append((download_task, file_name))
+        # Use caption from whichever message has one (Telegram puts it on the first)
+        if update.message.caption:
+            MEDIA_GROUP_BUFFERS[buffer_key]["caption"] = caption
 
-    # Check if user wants to resume a specific session
-    resume_id = RESUME_SESSION.pop(user_id, None)
-
-    # Build command
-    cmd = [
-        CLAUDE_PATH, "-p", user_message,
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
-    if resume_id:
-        cmd.extend(["--resume", resume_id])
-    elif not start_fresh:
-        cmd.append("--continue")
-
-    # Reuse _process_claude — file_name in the preview is handled via user_message
-    preview = f"[file: {file_name}] {caption[:60]}"
-    asyncio.create_task(_process_claude(user_id, update.message, cmd, preview, status_msg))
+    # Cancel previous timer and restart (debounce)
+    old_timer = MEDIA_GROUP_TIMERS.get(buffer_key)
+    if old_timer and not old_timer.done():
+        old_timer.cancel()
+    MEDIA_GROUP_TIMERS[buffer_key] = asyncio.create_task(
+        _flush_file_batch(buffer_key)
+    )
 
 
 async def cmd_start(update: Update, context) -> None:
@@ -709,7 +877,7 @@ async def cmd_recent(update: Update, context) -> None:
 
 
 async def cmd_stop(update: Update, context) -> None:
-    """Handle /stop command - interrupt the running Claude subprocess."""
+    """Handle /stop command - interrupt running Claude subprocess and clear queue."""
     log(f"[CMD] /stop from {update.effective_user.id}")
     user_id = update.effective_user.id
     if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
@@ -717,18 +885,44 @@ async def cmd_stop(update: Update, context) -> None:
         return
 
     proc = RUNNING_PROCS.get(user_id)
-    if not proc or proc.returncode is not None:
+    queue = USER_QUEUES.get(user_id)
+    has_proc = proc and proc.returncode is None
+    queued_count = queue.qsize() if queue else 0
+
+    if not has_proc and queued_count == 0:
         await update.message.reply_text("Nothing running to stop.")
         return
 
-    try:
-        proc.send_signal(signal.SIGINT)
-        log(f"[CMD] /stop - sent SIGINT to PID {proc.pid}")
-        await update.message.reply_text("🛑 Sent interrupt — Claude will stop after the current operation.")
-    except ProcessLookupError:
-        await update.message.reply_text("Process already finished.")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to stop: {str(e)[:200]}")
+    # Clear the queue so no more items get processed after current one finishes.
+    # Don't cancel the processor task — let it finish naturally so _process_claude
+    # can clean up the subprocess properly.
+    if queue:
+        while not queue.empty():
+            try:
+                _, _, _, status_msg, _ = queue.get_nowait()
+                # Clean up the "Queued..." status message so it doesn't hang
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+    # Interrupt the running subprocess
+    if has_proc:
+        try:
+            proc.send_signal(signal.SIGINT)
+            log(f"[CMD] /stop - sent SIGINT to PID {proc.pid}")
+        except ProcessLookupError:
+            pass
+
+    parts = []
+    if has_proc:
+        parts.append("interrupted current task")
+    if queued_count > 0:
+        parts.append(f"cleared {queued_count} queued message(s)")
+    await update.message.reply_text(f"🛑 Stopped — {', '.join(parts)}.")
 
 
 async def cmd_restart(update: Update, context) -> None:
